@@ -1468,3 +1468,15 @@ i5](http://dbis.rwth-aachen.de/). Now I am working on Yjs in my spare time.
 Fund this project by donating on [GitHub Sponsors](https://github.com/sponsors/dmonad)
 or hiring [me](https://github.com/dmonad) as a contractor for your collaborative
 app.
+
+---
+
+## 关于本仓库（学习注释版）
+
+- 这是**学习用的中文注释版**，不是上游官方仓库，也不代表上游维护者的立场。
+- 上游仓库：[yjs/yjs](https://github.com/yjs/yjs)
+- 上游提交基线：`52396473`
+- 新增注释范围：Yjs v14 核心链路（`src/` 下 YNode/Item 链表、编解码、同步更新链路），并附 `docs/annotation/y-protocols/` 协议源码副本。中文注释直接写在源码中，原有英文注释与代码逻辑全部保留。
+- 注释文档入口：[docs/annotation/READING-GUIDE.md](docs/annotation/READING-GUIDE.md)
+- 上游许可证：MIT；本仓已保留上游 [LICENSE](LICENSE) 原文。
+- 免责声明：代码版权归上游作者所有，本仓库仅用于个人学习；中文注释部分由本人编写。
