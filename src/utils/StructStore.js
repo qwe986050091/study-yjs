@@ -3,6 +3,22 @@ import { createID } from './ID.js'
 import { createDeleteSetFromStructStore, createIdSet } from './ids.js'
 import { findIndexSS } from './transaction-helpers.js'
 
+// ============================================================================
+// 【中文导读】StructStore = 按 client 分桶的 struct 仓库
+//
+// 链路位置：Doc.store 就是它。Item.integrate 成功后把 struct 写进来；
+// 解码 update 时用它判断“这个 clock 我收到没有”；encodeStateAsUpdate 也从这里取。
+//
+// 两类索引必须分清：
+//   - 文档顺序：Item.left/right 这条双向链表（在 Item 上，不在本文件）
+//   - 插入顺序：本文件的 clients: Map<client, Array<Item|GC|Skip>>，按 clock 升序
+//
+// 关键不变量：
+//   1. 每个 client 的数组按 id.clock 升序，且相邻 struct 的 clock 区间无缝（除 Skip 空洞）。
+//   2. 一个 struct 覆盖 [id.clock, id.clock + length)。
+//   3. 数组里可以有 Skip：它是“这段 clock 我还没收到”的占位，不是内容。
+// ============================================================================
+
 export class StructStore {
   constructor () {
     /**
@@ -37,17 +53,23 @@ export class StructStore {
     } else {
       const lastStruct = structs[structs.length - 1]
       if (lastStruct.id.clock + lastStruct.length !== struct.id.clock) {
+        // 不是简单追加：说明 clock 有空洞，或这段 clock 之前被 Skip 占了。
+        // 场景：先收到 update B（依赖 update A），B 里缺失的 clock 先写成 Skip；
+        // 之后 A 到达，这里要把 Skip 精确切开并换成真正的 struct。
         // this replaces an integrated skip
         let index = findIndexSS(structs, struct.id.clock)
         const skip = structs[index]
         const diffStart = struct.id.clock - skip.id.clock
         const diffEnd = skip.id.clock + skip.length - struct.id.clock - struct.length
+        // 前半段仍是空洞 -> 保留一个更小的 Skip
         if (diffStart > 0) {
           structs.splice(index++, 0, new Skip(createID(struct.id.client, skip.id.clock), diffStart))
         }
+        // 后半段仍是空洞 -> 再保留一个 Skip
         if (diffEnd > 0) {
           structs.splice(index + 1, 0, new Skip(createID(struct.id.client, struct.id.clock + struct.length), diffEnd))
         }
+        // 中间这一段用真实 struct 顶替 Skip，并同步删掉 store.skips 里对应的空洞记录。
         structs[index] = struct
         this.skips.delete(struct.id.client, struct.id.clock, struct.length)
         return
@@ -122,10 +144,13 @@ export class StructStore {
  */
 export const getStateVector = store => {
   const sm = new Map()
+  // 正常情况：每个 client 的“下一个期望 clock” = 最后一个 struct 的末尾。
   store.clients.forEach((structs, client) => {
     const struct = structs[structs.length - 1]
     sm.set(client, struct.id.clock + struct.length)
   })
+  // 有 Skip 时，state vector 不能越过空洞起点：否则对端会以为这段已经收到。
+  // 这里取每个 Skip 区间的起始 clock，等于“只能确认到空洞之前”。
   store.skips.clients.forEach((range, client) => {
     sm.set(client, range.getIds()[0].clock)
   })

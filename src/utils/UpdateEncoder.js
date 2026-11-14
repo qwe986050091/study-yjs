@@ -1,6 +1,19 @@
 import * as error from 'lib0/error'
 import * as encoding from 'lib0/encoding'
 
+// ============================================================================
+// 【中文导读】UpdateEncoder = update 的写端（V1 / V2）
+//
+// V1：字段直接按 varUint/varString 平铺，简单但重复多、体积大。
+// V2：把 struct 字段按“列”拆开，分别用 RLE / 差分编码压缩：
+//   client、leftClock、rightClock、info、parentInfo、typeRef、len 各一个编码器，
+//   最后 toUint8Array 时依次写出各列，尾部追加未优化字段（字符串/any/buf）。
+// 两者实现同一组 writeXxx 方法，Item.write / YNode._write 不需要感知版本。
+//
+// 关键点：V2 的 clock/len 是“相对上一个值”的差分；IdSetEncoderV2 的
+// dsCurrVal 就是差分基准，每个 client 开始前必须 resetIdSetCurVal()。
+// ============================================================================
+
 export class IdSetEncoderV1 {
   constructor () {
     this.restEncoder = encoding.createEncoder()

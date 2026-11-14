@@ -8,6 +8,8 @@ export const structSkipRefNumber = 10
 /**
  * @private
  */
+// Skip = “这段 clock 还没收到”的占位。先收到依赖后到 update 时，缺失区间用 Skip 填上；
+// 真 struct 到达后由 StructStore.add 把 Skip 切开替换。Skip 不会被广播为内容。
 export class Skip extends AbstractStruct {
   get deleted () {
     return false

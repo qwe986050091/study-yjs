@@ -1,5 +1,13 @@
 import * as error from 'lib0/error'
 
+// ============================================================================
+// 【中文导读】AbstractStruct = Item / GC / Skip 的最小公共契约
+//
+// 一个 struct 只承诺三件事：`id`（client + 起始 clock）、`length`（覆盖多少 clock）、
+// 以及可被 Store 调用的 splice / mergeWith / write / integrate。
+// 文档顺序（left/right）只有 Item 有；GC/Skip 只存在于 StructStore 的 clock 数组中。
+// ============================================================================
+
 export class AbstractStruct {
   /**
    * @param {ID} id

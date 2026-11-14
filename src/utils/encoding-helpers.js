@@ -7,6 +7,16 @@ import { Skip } from '../structs/Skip.js'
 import { createID } from './ID.js'
 import { writeIdSet } from './ids.js'
 
+// ============================================================================
+// 【中文导读】encoding-helpers = 把 store / transaction 的 struct 写进 update
+//
+// 三个入口层层收窄：
+//   writeStructs(store 的一段) -> writeStructsFromIdSet(按 ID 集合选 struct)
+//   -> writeStructsFromTransaction(只写本事务 insertSet)
+// 与 BlockSet.writeBlockSet 的区别：这里直接读 StructStore，按给定时钟区间
+// 找 struct，跨区间的首尾会带 offset 只写命中部分；Skip 也按缺口写出。
+// ============================================================================
+
 /**
  * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
  * @param {Array<GC|Item|Skip>} structs All structs by `client`
@@ -16,6 +26,9 @@ import { writeIdSet } from './ids.js'
  * @function
  */
 export const writeStructs = (encoder, structs, client, idranges) => {
+  // idranges 是“要写的 clock 区间”，先与 structs 的实际范围求交，再二分定位。
+  // 区间之间若有空洞，用 Skip 填上，保证解码端看到的 clock 连续。
+  // 同一 struct 跨区间边界时，start/end 用 offset 只写一部分。
   let structsToWrite = 0 // this accounts for the skips
   /**
    * @type {Array<{ start: number, end: number, startClock: number, endClock: number }>}
@@ -101,6 +114,8 @@ export const writeStructsFromTransaction = (encoder, transaction) => writeStruct
  * @return {boolean} Whether data was written.
  */
 export const writeUpdateMessageFromTransaction = (encoder, transaction) => {
+  // 事务提交时生成增量 update：insertSet 的 struct + deleteSet。
+  // 两者都空则返回 false，调用方不会 emit 空 update。
   if (transaction.deleteSet.clients.size === 0 && transaction.insertSet.clients.size === 0) {
     return false
   }

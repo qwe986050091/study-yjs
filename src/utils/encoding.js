@@ -13,6 +13,23 @@
  * 6: Item with Format content (a formatting marker for richtext content)
  * 7: Item with Type
  */
+// ============================================================================
+// 【中文导读】encoding.js = update 的入口与 struct 集成调度
+//
+// 一次 update 的二进制布局（V2）：
+//   [0] 若干 client 的 struct 块（BlockSet） -> [1] 删除集（IdSet）
+// 本文件负责：
+//   - encodeStateAsUpdate：把 store 的 struct + 删除集写成一个 update
+//   - readUpdateV2：解码 -> 排除本地已知的 clock -> integrateStructs -> 应用删除集
+//   - integrateStructs：拓扑排序式集成；依赖缺失时写 Skip 并暂存 pendingStructs
+//   - getMissing：把 Item 的 origin/rightOrigin/parent 解析成本地 Item，决定是否缺依赖
+//   - state vector 的读写（差分编码的基础）
+//
+// 关键不变量：
+//   1. 远端 update 一律以 local=false 开启事务，避免被当成用户本地编辑。
+//   2. struct 必须按 clock 连续集成；遇到空洞写 Skip，后续补到的 update 再填。
+//   3. 删除集可以在 struct 尚未到齐时先暂存（pendingDs），等依赖到齐再应用。
+// ============================================================================
 
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
@@ -43,6 +60,9 @@ import { writeStructs } from './encoding-helpers.js'
  * @function
  */
 export const writeClientsStructs = (encoder, store, _sm) => {
+  // _sm = 目标端的 state vector（client -> 已知 clock）。只写对方还没有的区间。
+  // 对 _sm 里没有的 client，表示对方一无所知，从 clock 0 开始写。
+  // 排序用 client 降序：冲突消解时高 client 先到，能减少待处理栈的深度。
   // we filter all valid _sm entries into sm
   const sm = new Map()
   _sm.forEach((clock, client) => {
@@ -95,6 +115,13 @@ export const writeClientsStructs = (encoder, store, _sm) => {
  * @function
  */
 const integrateStructs = (transaction, store, clientsStructRefs) => {
+  // 集成的核心是一个“按依赖回溯”的栈：
+  //   - 当前 struct 有缺失依赖 -> 把当前 struct 压栈，转而读缺失 client 的块
+  //   - 没有缺失 -> integrate，然后优先弹栈（处理刚被阻塞的项）
+  //   - 栈空 -> 读下一个 client 的块
+  // 因为依赖关系无环，栈深度不会超过参与本次 update 的 client 数。
+  // 若某个缺失依赖本次 update 也没带，就把剩余块重新编码成 restStructs 返回，
+  // 由调用方存进 store.pendingStructs，等后续 update 再重试。
   /**
    * @type {Array<Item | GC | Skip>}
    */
@@ -180,6 +207,7 @@ const integrateStructs = (transaction, store, clientsStructRefs) => {
       const offset = localClock - stackHead.id.clock
       const missing = getMissing(/** @type {any} */ (stackHead), transaction, store)
       if (missing !== null) {
+        // 依赖的 client 还没到齐：压栈并切换读取源。
         stack.push(stackHead)
         // get the struct reader that has the missing struct
         /**
@@ -197,6 +225,8 @@ const integrateStructs = (transaction, store, clientsStructRefs) => {
       } else {
         // all fine, apply the stackhead
         // but first add a skip to structs if necessary
+        // offset < 0：本地已知 clock 比这个 struct 的起点还靠后，说明中间有空洞。
+        // 先用 Skip 占住 [localClock, stackHead.id.clock)，保证 clock 连续。
         if (offset < 0) {
           const skip = new Skip(createID(stackHead.id.client, localClock), -offset)
           skip.integrate(transaction, 0)
@@ -246,6 +276,7 @@ const integrateStructs = (transaction, store, clientsStructRefs) => {
 export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = new UpdateDecoderV2(decoder)) =>
   ydoc.transact(transaction => {
     // force that transaction.local is set to non-local
+    // 远端 update 不是本地编辑；local=false 会影响更新事件、search marker 清理、格式清理。
     transaction.local = false
     let retry = false
     const doc = transaction.doc
@@ -254,6 +285,8 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     const ss = readBlockSet(structDecoder)
     const knownState = createIdSet()
     ss.clients.forEach((_, client) => {
+      // 先把本地已经收到的全部 clock 视为“已知”，再把 Skip 空洞从已知集合中扣掉：
+      // 否则本地只有 Skip 的区间会被误认为“已有内容”，从而丢弃对端发来的真 struct。
       const storeStructs = store.clients.get(client)
       if (storeStructs) {
         const last = storeStructs[storeStructs.length - 1]
@@ -273,6 +306,8 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     const restStructs = integrateStructs(transaction, store, ss)
     const pending = store.pendingStructs
     if (pending) {
+      // 之前有“依赖缺失”的 update 挂起。本次 update 可能补上了它缺的 client：
+      // 只要 pending.missing 里任一 (client, clock) 已被满足，就重试整包 pending。
       // check if we can apply something
       for (const [client, clock] of pending.missing) {
         if (ss.clients.has(client) || clock < store.getClock(client)) {
@@ -320,6 +355,8 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     // console.log('time to resume delete readers: ', performance.now() - start) // @todo remove
     // start = performance.now()
     if (retry) {
+      // 在事务内递归应用挂起的 update。此时 store 已经包含本次新 struct，
+      // 之前缺失的依赖通常已满足；pendingStructs 先清空避免重复合并。
       const update = /** @type {{update: Uint8Array}} */ (store.pendingStructs).update
       store.pendingStructs = null
       applyUpdateV2(transaction.doc, update)
@@ -380,6 +417,8 @@ export const applyUpdate = (ydoc, update, transactionOrigin) => applyUpdateV2(yd
  * @function
  */
 export const writeStateAsUpdate = (encoder, doc, targetStateVector = new Map()) => {
+  // 全量/差量编码：先写 struct 块，再写删除集。删除集不能省——
+  // 对端即使已有全部 struct，也需要它来知道哪些内容被删过。
   writeClientsStructs(encoder, doc.store, targetStateVector)
   writeIdSet(encoder, doc.store.ds)
 }
@@ -401,6 +440,9 @@ export const encodeStateAsUpdateV2 = (doc, encodedTargetStateVector = new Uint8A
   const targetStateVector = decodeStateVector(encodedTargetStateVector)
   writeStateAsUpdate(encoder, doc, targetStateVector)
   const updates = [encoder.toUint8Array()]
+  // 把挂起的更新也并进来：pendingDs 是“只有删除集”的 update；
+  // pendingStructs 是依赖缺失的 struct 包，先按目标 state vector 做 diff 再合并。
+  // 这样 encodeStateAsUpdate 的调用方拿到的永远是“当前可见状态”，不会漏掉暂存内容。
   // also add the pending updates (if there are any)
   if (doc.store.pendingDs) {
     updates.push(doc.store.pendingDs)
@@ -461,6 +503,8 @@ export const readStateVector = decoder => {
  * @return {Uint8Array<ArrayBuffer>}
  */
 export const mergeUpdatesV2 = (updates, YDecoder = UpdateDecoderV2, YEncoder = UpdateEncoderV2) => {
+  // 合并 = struct 块按 client 取并集（BlockSet.insertInto 填洞、去重）
+  //      + 删除集取并集（mergeIdSets）。不是简单拼接字节。
   if (updates.length === 1) {
     return updates[0]
   } else if (updates.length === 0) {
@@ -495,6 +539,8 @@ export const mergeUpdates = updates => mergeUpdatesV2(updates, UpdateDecoderV1, 
  * @param {typeof UpdateEncoderV1 | typeof UpdateEncoderV2} [YEncoder]
  */
 export const diffUpdateV2 = (update, sv, YDecoder = UpdateDecoderV2, YEncoder = UpdateEncoderV2) => {
+  // 从 update 里裁掉目标端已知的 clock：逐 client 跳过 <= svClock 的 struct，
+  // 若某个 struct 跨越边界则只写后半段（offset）。注意第一个写出的 struct 不能是 Skip。
   const state = decodeStateVector(sv)
   const encoder = new YEncoder()
   const lazyStructWriter = new LazyStructWriter(encoder)
@@ -618,6 +664,11 @@ export const encodeStateVector = doc => encodeStateVectorV2(doc, new IdSetEncode
  * @return {null | number}
  */
 const getMissing = (struct, transaction, store) => {
+  // 判断一个 Item 的依赖是否到齐，并顺便把远端 ID 解析成本地 Item：
+  //   - origin / rightOrigin：必须已收到且不能被 Skip 占位
+  //   - parent：可以是顶层 key（string）、父 Item ID（ID）或已解析的 YNode
+  // 返回缺失依赖的 client；返回 null 表示依赖齐全，可以 integrate。
+  // 注意：一旦把 origin/rightOrigin 改写成本地 lastId/id，就不能再回头读原始字节。
   if (struct.constructor !== Item) return null
   // we may not access these variables anymore after they have been written!
   const origin = struct.origin

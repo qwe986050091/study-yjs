@@ -10,6 +10,20 @@ import { createID } from './ID.js'
  * These helpers are used by items to integrate themselves
  */
 
+// ============================================================================
+// 【中文导读】transaction-helpers = struct 层的“手术刀”
+//
+// 这里没有业务语义，只有对 `store.clients[client]` 数组和 Item 链表的原子操作：
+//   - findIndexSS：在按 clock 排序的数组上二分，定位覆盖某 clock 的 struct
+//   - getItemCleanStart / getItemCleanEnd：把 Item 切开，保证边界正好落在 id 上
+//   - tryToMergeWithLefts：合并相邻同源 Item
+//   - tryGcDeleteSet / tryMerge：事务提交后的 GC 与合并
+//   - cleanupFormattingGap：删除文本后清理不再需要的格式标记
+//
+// 关键不变量：这些函数会原地修改 struct 数组（splice），调用方拿到的下标可能失效；
+// 需要下标时先查找、后修改，不要跨修改复用。
+// ============================================================================
+
 /**
  * Perform a binary search on a sorted array
  * @param {Array<Item|GC|Skip>} structs
@@ -20,6 +34,7 @@ import { createID } from './ID.js'
  * @function
  */
 export const findIndexSS = (structs, clock) => {
+  // 先做一次“按比例猜测”的 pivot，再退回标准二分；命中任何 struct 的 [clock, clock+len) 即返回。
   let left = 0
   let right = structs.length - 1
   let mid = structs[right]
@@ -91,6 +106,8 @@ export const getItemCleanStart = (transaction, id) => {
  * @function
  */
 export const getItemCleanEnd = (transaction, store, id) => {
+  // 要求 id 恰好是某个 Item 的“最后一个字符”；否则把该 Item 从 id 之后切开，
+  // 让 id 落在左半段的末尾。getMissing 里把 origin 对齐到 lastId 用的就是它。
   const structs = store.clients.get(id.client) || []
   const index = findIndexSS(structs, id.clock)
   const struct = structs[index]
@@ -210,6 +227,8 @@ export const nextID = transaction => {
  */
 export const addChangedTypeToTransaction = (transaction, type, parentSub) => {
   const item = type._item
+  // 如果 type 本身是本事务新建的，它在文档里“从无到有”，不该再触发自身的 changed 事件；
+  // 真正的变更已经记在它的父类型上。只有已经存在的类型才登记 parentSub。
   if (item === null || !transaction.insertSet.hasId(item.id)) {
     map.setIfUndefined(transaction.changed, type, set.create).add(parentSub)
   }
@@ -221,6 +240,8 @@ export const addChangedTypeToTransaction = (transaction, type, parentSub) => {
  * @return {number} # of merged structs
  */
 export const tryToMergeWithLefts = (structs, pos) => {
+  // 从 pos 向左连续尝试 mergeWith；一旦失败就停（不跳过不可合并的 struct）。
+  // 返回合并掉的 struct 数，调用方据此 splice 掉尾部。
   let right = structs[pos]
   let left = structs[pos - 1]
   let i = pos
@@ -249,6 +270,8 @@ export const tryToMergeWithLefts = (structs, pos) => {
  * @param {function(Item):boolean} gcFilter
  */
 export const tryGcDeleteSet = (tr, ds, gcFilter) => {
+  // 只回收“本事务删除集覆盖到”的 Item；对每个 client 的 struct 数组从右往左扫，
+  // 因为 GC 可能替换 struct，倒序可避免下标失效。
   for (const [client, _deleteItems] of ds.clients.entries()) {
     const deleteItems = _deleteItems.getIds()
     const structs = /** @type {Array<Item>} */ (tr.doc.store.clients.get(client))
@@ -279,6 +302,7 @@ export const tryGcDeleteSet = (tr, ds, gcFilter) => {
 export const tryMerge = (ds, store) => {
   // try to merge deleted / gc'd items
   // merge from right to left for better efficiency and so we don't miss any merge targets
+  // 只沿删除集涉及的区间尝试合并：未删除的相邻 Item 在插入时已经有机会合并。
   ds.clients.forEach((_deleteItems, client) => {
     const deleteItems = _deleteItems.getIds()
     const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
@@ -362,6 +386,8 @@ export const updateCurrentFormats = (currentFormats, { key, value }) => {
  * @function
  */
 export const cleanupFormattingGap = (transaction, start, curr, startFormats, currFormats) => {
+  // 删除文本后，两个内容 Item 之间可能残留只开不关、或被后续格式覆盖的 ContentFormat。
+  // 这里把 [start, curr) 里的格式标记与 endFormats/startFormats 比对，删掉无意义的标记。
   if (!transaction.doc.cleanupFormatting) return 0
   /**
    * @type {Item|null}

@@ -6,6 +6,18 @@ import { Item, followRedone, ContentType } from '../structs/Item.js'
 import { writeID, readID, compareIDs, findRootTypeKey, createID } from './ID.js'
 import { rendererContentLength } from './renderer-helpers.js'
 
+// ============================================================================
+// 【中文导读】RelativePosition = 可跨端/跨版本还原的光标
+//
+// 绝对下标（“第 3 个字符”）在并发编辑后会漂移；RelativePosition 存的是
+// “锚在哪个 struct 的哪一侧”：
+//   - type：顶层类型 ID（顶层 YNode 没有 Item，只能记 ID）
+//   - item：内部类型/位置锚定的 Item ID（可为 null）
+//   - assoc：>=0 贴后一个字符，<0 贴前一个字符
+// 还原时查本地 store，找到锚点 Item，再按 assoc 换算成当前下标。
+// 若锚点已被 GC/删除，则退回“最近的存活祖先”，并在结果里带 `deleted` 标记。
+// ============================================================================
+
 /**
  * A relative position is based on the Yjs model and is not affected by document changes.
  * E.g. If you place a relative position before a certain character, it will always point to this character.
@@ -38,6 +50,8 @@ export class RelativePosition {
    * @param {number} assoc
    */
   constructor (type, tname, item, assoc = 0) {
+    // type：顶层类型 ID；tname：顶层 key（编码时二选一，解码优先 type）
+    // item：锚定的内部 Item；assoc 决定贴左还是贴右。
     /**
      * @type {ID|null}
      */

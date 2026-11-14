@@ -4,6 +4,16 @@ import * as set from 'lib0/set'
 import { diffIdSet, intersectSets, mergeIdSets } from './ids.js'
 import { createAbsolutePositionFromRelativePosition, createRelativePosition } from './RelativePosition.js'
 
+// ============================================================================
+// 【中文导读】YEvent = 观察者拿到的一次变更视图
+//
+// 它不复制数据，只持有：
+//   - target / transaction：谁变了、哪个事务
+//   - childListChanged / keysChanged：列表变了还是某些 map key 变了
+//   - _delta：按需从 transaction.insertSet/deleteSet 投影出的 delta（惰性计算）
+// 因此事件对象只在观察者回调期间有效；别把它存起来跨事务使用。
+// ============================================================================
+
 /**
  * @template {DeltaConf} DConf
  * YEvent describes the changes on a YNode.
@@ -67,6 +77,8 @@ export class YEvent {
    * @return {boolean}
    */
   deletes (struct) {
+    // 判断“本事务是否删了这段”。注意它和 change.deleted 不同：
+    // 一个在本事务里“先插入后删除”的 struct 也会返回 true。
     return this.transaction.deleteSet.hasId(struct.id)
   }
 
@@ -92,6 +104,9 @@ export class YEvent {
    * @public
    */
   getDelta ({ renderer = this.target._renderer, deep } = {}) {
+    // 惰性计算 delta：把 target 的 toDelta 限定在本事务的 insert/deleted 区间内。
+    // 浅层只投影 target 自身；deep 会带上子类型变更（供 observeDeep）。
+    // renderer 决定嵌套 YNode 如何展开成普通值。
     const insertSet = this.transaction.insertSet
     const deleteSet = this.transaction.deleteSet
     // content that was both inserted AND deleted by this transaction is normally invisible — but a

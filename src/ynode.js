@@ -36,6 +36,24 @@ import { transact } from './utils/Transaction.js'
 import { YEvent } from './utils/YEvent.js'
 import { $doc } from './utils/schemas.js'
 
+// ============================================================================
+// 【中文导读】ynode.js = v14 的统一类型系统
+//
+// 重要变化：v14 没有 `YArray` / `YMap` / `YText` 这些子类，只有一个 YNode。
+// 类型形状由 `name` + delta schema 决定；列表、映射、文本共用同一套 Item 链表：
+//   - 列表子项：parentSub === null，从 `_start` 沿 right 走
+//   - 映射键值：parentSub === key，当前值在 `_map`
+//   - 文本：仍是列表，只是内容多为 ContentString + ContentFormat（格式是零宽 Item）
+//
+// YNode 不直接改 store，而是先定位到 ItemTextListPosition / 目标 Item，
+// 再 `new Item(...).integrate(transaction, 0)`。真正的位置计算在这里：
+//   - findMarker / ArraySearchMarker：最多 80 个位置缓存，避免 O(n) 线性扫
+//   - typeListInsertGenerics / typeListDelete / nodeMapSet：用户 API 的落点
+//
+// 阅读建议：先读 YNode 类字段与 `_integrate`，再读列表操作，最后读 `toDelta`
+// （它只负责“把 CRDT 状态投影成 delta”，不参与冲突解决）。
+// ============================================================================
+
 /**
  * @typedef {Object<string,any>|Array<any>|number|null|string|Uint8Array|BigInt|YNode<any>} YValue
  */
@@ -96,6 +114,9 @@ export const createAttributionFromAttributionItems = (attrs, deleted) => {
 let globalSearchMarkerTimestamp = 0
 
 export class ItemTextListPosition {
+  // 文本编辑的游标：left/right 是当前位置两侧的 Item，index 是可见字符下标，
+  // currentFormats 是当前位置仍然生效的格式集合。forward() 跳过已删除/零宽 Item。
+  // 所有文本插入/删除都先构造这个游标，再调用 insertContent/deleteText。
   /**
    * @param {Item|null} left
    * @param {Item|null} right
@@ -336,6 +357,8 @@ const insertFormats = (transaction, parent, currPos, formats) => {
  * @function
  **/
 export const insertContent = (transaction, parent, currPos, content, formats) => {
+  // 文本插入 = 先补格式开/关标记，再在当前游标位置新建 Item 并 integrate。
+  // 注意 updateMarkerChanges 必须在真正插入前调用：它按“插入前下标”调整缓存。
   currPos.currentFormats.forEach((_val, key) => {
     if (formats[key] === undefined) {
       formats[key] = null
@@ -399,6 +422,11 @@ export const insertContentHelper = (transaction, parent, currPos, insert, format
  * @function
  */
 export const deleteText = (transaction, currPos, length) => {
+  // 从游标向右删 length 个“可见字符”。三种情况：
+  //   1. 普通可计数 Item：必要时先切，再 delete
+  //   2. 带 renderer 的已删除内容：记录“归因删除”到 transaction.meta.attributedDeletes
+  //   3. 零宽格式 Item：跳过（continue 由 forward 完成）
+  // 删除完成后统一清理因此变得多余的格式标记。
   const startLength = length
   const startFormats = map.copy(currPos.currentFormats)
   const start = currPos.right
@@ -463,6 +491,8 @@ export const deleteText = (transaction, currPos, length) => {
 }
 
 export class ArraySearchMarker {
+  // 一个缓存点：p 是链表节点，index 是它在可见序列中的下标，timestamp 用于 LRU 淘汰。
+  // marker=true 会写进 Item.info 的 BIT4，避免同一 Item 被多个 marker 同时指向。
   /**
    * @param {Item} p
    * @param {number} index
@@ -527,6 +557,9 @@ const markPosition = (searchMarker, p, index) => {
  * @param {number} index
  */
 export const findMarker = (yarray, index) => {
+  // 从“下标最接近的 marker”出发向左右局部走，而不是从 _start 线性扫。
+  // 走完后还会向左吃掉可合并的连续段，防止 marker 指向的 Item 之后被 merge 掉。
+  // 返回前决定：复用旧 marker（覆盖）还是新建（最多 maxSearchMarker=80 个）。
   if (yarray._start === null || index === 0 || yarray._searchMarker === null) {
     return null
   }
@@ -584,6 +617,9 @@ export const findMarker = (yarray, index) => {
  * @param {number} len If insertion, len is positive. If deletion, len is negative.
  */
 export const updateMarkerChanges = (searchMarker, index, len) => {
+  // 在插入/删除发生前调用：把位于 index 之后的 marker 下标整体平移。
+  // len > 0 是插入；len < 0 是删除。删除时若 marker 正好指向被删项，
+  // 会把 p 向左挪到最近的未删除可计数 Item，必要时直接移除 marker。
   for (let i = searchMarker.length - 1; i >= 0; i--) {
     const m = searchMarker[i]
     if (len > 0) {
@@ -679,6 +715,14 @@ export const callTypeObservers = (type, transaction, event) => {
  * @extends {ObservableV2<{ delta: (delta: delta.Delta<DConf>, origin: any) => void, destroy: (type: YNode<DConf>) => void }>}
  */
 export class YNode extends ObservableV2 {
+  // 统一共享类型。字段分工：
+  //   _item：本类型作为“某个 Item 的内容”时的反向指针；顶层类型为 null
+  //   _start：列表/文本的第一个子 Item（map 不用）
+  //   _map：map key -> 该 key 最新的 Item（列表不用）
+  //   _length：可见子项长度之和（只算未删除、可计数、parentSub=null 的 Item）
+  //   _searchMarker：位置缓存数组，最多 80 个
+  //   _delta：toDelta 的持续缓存（首次访问才建立）
+  // 不变量：`_length` 与实际遍历计数必须一致；不一致先查 Item.integrate/delete 里的增减。
   /**
    * @param {delta.DeltaConfGetName<DConf>?} name
    */
@@ -928,6 +972,8 @@ export class YNode extends ObservableV2 {
    * @param {Item|null} item
    */
   _integrate (y, item) {
+    // 挂到文档上。若类型在“未加入文档”时就被写入了内容，这些写入暂存在 _prelim，
+    // 这里一次性 applyDelta 回放，保证先写后挂也能得到同样的 delta。
     this.doc = y
     this._item = item
     if (this._prelim) {
@@ -1031,6 +1077,11 @@ export class YNode extends ObservableV2 {
    * @public
    */
   toDelta (opts = {}) {
+    // 两个模式：
+    //   1. 全量：itemsToRender=null，遍历全部子项，输出当前完整状态
+    //   2. 变更范围：itemsToRender=某次事务的 ID 集合，只输出这次变更涉及的片段
+    //      （用于 diff renderer / 'delta' 事件，避免把整篇文档重新投影）
+    // 它只是“读投影”，不会修改 CRDT；真正写入走 applyDelta。
     const { renderer = this._renderer, itemsToRender = null, retainInserts = false, retainDeletes = false, insertedItems = null, deep = false } = opts
     const { modified = (deep && itemsToRender) ? computeModifiedFromItems(/** @type {Doc} */ (this.doc).store, itemsToRender) : null } = opts
     // change-scoped render (`itemsToRender` given): a type that is neither in `modified` nor itself
@@ -1595,6 +1646,13 @@ export class YNode extends ObservableV2 {
    * @public
    */
   applyDelta (d, origin = null, { renderer = this._renderer } = {}) {
+    // 把 delta 投影回 CRDT：
+    //   textOp/insertOp -> insertContent（走 Item.integrate）
+    //   retainOp        -> formatText（只改格式，不改内容）
+    //   deleteOp        -> deleteText
+    //   modifyOp        -> 对嵌套 YNode 递归 applyDelta
+    //   attrs           -> nodeMapSet / nodeMapDelete
+    // 未挂载文档时先存 _prelim；已删除但仍在渲染的节点不应用，返回逆操作供调用方回滚。
     if (d.isEmpty()) return null
     if (this.doc == null) {
       (this._prelim || (this._prelim = /** @type {any} */ (delta.create()))).apply(d)
@@ -2057,6 +2115,8 @@ export class YNode extends ObservableV2 {
    * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder The encoder to write data to.
    */
   _write (encoder) {
+    // 类型本身写入 update 的字段：typeRef + （XML 元素/hook 才有的）name。
+    // 普通 YNode 只写 ref；v14 用 _legacyTypeRef 保留 v13 的 XML 兼容 id。
     encoder.writeTypeRef(this._legacyTypeRef)
     switch (this._legacyTypeRef) {
       case YXmlElementRefID:
@@ -2272,6 +2332,9 @@ export const typeListGet = (type, index) => {
  * @function
  */
 export const typeListInsertGenericsAfter = (transaction, parent, referenceItem, content) => {
+  // 在 referenceItem 之后插入一批值。普通 JSON 值会先攒进 jsonContent，
+  // 遇到 YNode / Uint8Array / Doc 等特殊值时先 flush，再单独建 Item——
+  // 这样连续标量共享一个 ContentAny，减少 Item 数量，但不改变顺序语义。
   let left = referenceItem
   const doc = transaction.doc
   const ownClientId = doc.clientID
@@ -2340,6 +2403,11 @@ const lengthExceeded = () => error.create('Length exceeded!')
  * @function
  */
 export const typeListInsertGenerics = (transaction, parent, index, content) => {
+  // 用户 API `list.insert(index, ...)` 的落点：
+  //   1. 越界直接抛
+  //   2. index=0 走头部快路径（要更新 marker）
+  //   3. 否则用 findMarker 定位，再线性微调；切点落在 Item 中间时先 split
+  //   4. 最后统一走 typeListInsertGenericsAfter
   if (index > parent._length) {
     throw lengthExceeded()
   }
@@ -2413,6 +2481,8 @@ export const typeListPushGenerics = (transaction, parent, content) => {
  * @function
  */
 export const typeListDelete = (transaction, parent, index, length) => {
+  // 先定位到第一个要删的 Item（必要时 split 出精确边界），再沿 right 逐个 delete。
+  // 删除只打标记，可见长度由 Item.delete 自己维护；这里最后统一平移 marker。
   if (length === 0) { return }
   const startIndex = index
   const startLength = length
@@ -2477,6 +2547,9 @@ export const nodeMapDelete = (transaction, parent, key) => {
  * @function
  */
 export const nodeMapSet = (transaction, parent, key, value) => {
+  // map 写入 = 在 key 的链表尾部追加一个新 Item（parentSub=key）。
+  // 旧值不是物理覆盖：新 Item 成为 _map[key] 的当前值，旧 Item 在 integrate 里被 delete。
+  // 因此同一个 key 的所有历史值都留在链表里，删除/快照才能回溯。
   const left = parent._map.get(key) || null
   const doc = transaction.doc
   const ownClientId = doc.clientID
@@ -2519,6 +2592,7 @@ export const nodeMapSet = (transaction, parent, key, value) => {
  * @function
  */
 export const nodeMapGet = (parent, key) => {
+  // 读 map 的当前值：_map 指向该 key 最新 Item；已删除则视为不存在。
   parent.doc ?? warnPrematureAccess()
   const val = parent._map.get(key)
   return val !== undefined && !val.deleted ? val.content.getContent()[val.length - 1] : undefined
@@ -2841,6 +2915,8 @@ export const readContentDeleted = decoder => new ContentDeleted(decoder.readLen(
  * @type {Array<function(UpdateDecoderV1 | UpdateDecoderV2):AbstractContent>}
  */
 export const contentRefs = [
+  // 下标 = Item.write 写进 info 低 5 位的 content ref。解码时按同一张表还原。
+  // 1..9 是内容类型；0(GC) 与 10(Skip) 不是 Item 内容，读到时直接报错。
   () => { error.unexpectedCase() }, // GC is not ItemContent
   readContentDeleted, // 1
   readContentJSON, // 2
@@ -2859,6 +2935,8 @@ export const contentRefs = [
  * @param {number} info
  */
 export const readItemContent = (decoder, info) => contentRefs[info & binary.BITS5](decoder)
+// info 低 5 位引用 contentRefs；高位是 origin/rightOrigin/parentSub 的存在标志，
+// 由 BlockSet.readBlockSet 在调用本函数前读取。位布局见 Item.write。
 
 /**
  * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder
@@ -2868,6 +2946,7 @@ export const readItemContent = (decoder, info) => contentRefs[info & binary.BITS
  * @function
  */
 export const readYNode = decoder => {
+  // 与 YNode._write 对称：先读 typeRef；只有 XML 元素/hook 额外读 name。
   const typeRef = decoder.readTypeRef()
   const ynode = new YNode(typeRef === YXmlElementRefID || typeRef === YXmlHookRefID ? decoder.readKey() : null)
   ynode._legacyTypeRef = typeRef

@@ -6,6 +6,8 @@ export const structGCRefNumber = 0
 /**
  * @private
  */
+// GC = 已回收内容的“墓碑”。它不再保存原文，只保留 id + length，
+// 以便 state vector / clock 对齐仍然成立；读到它时不会恢复任何内容。
 export class GC extends AbstractStruct {
   get deleted () {
     return true

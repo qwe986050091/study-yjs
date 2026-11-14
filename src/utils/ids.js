@@ -12,6 +12,22 @@ import { iterateStructs, findIndexSS, iterateStructsWithoutSplits, tryGc } from 
 import { UpdateEncoderV2, IdSetEncoderV2 } from './UpdateEncoder.js'
 import { IdSetDecoderV2 } from './UpdateDecoder.js'
 
+// ============================================================================
+// 【中文导读】ids.js = 删除集与“按 ID 区间”的容器
+//
+// Yjs 的删除不是新 struct，而是“某些 (client, clock 区间) 被删了”。这些区间用
+// IdSet 表示：Map<client, IdRanges>，每个 IdRanges 是一组排好序、可合并的 [clock, len)。
+// 同一套容器也用于：
+//   - transaction.deleteSet / structStore.skips
+//   - update 尾部的 delete set
+//   - IdMap：给区间附加归因（ContentAttribute），用于 diff/建议模式
+//
+// 关键不变量：
+//   1. getIds() 返回“排序并合并后的最大区间”，调用方不要再假设原始顺序。
+//   2. add 只高效支持“向前追加”；乱序 add 会把 sorted 置 false，等 getIds 时排序。
+//   3. 所有区间都是左闭右开 [clock, clock+len)。
+// ============================================================================
+
 /**
  * @typedef {{ inserts: IdSet, deletes: IdSet }} ContentIds
  */
@@ -85,6 +101,8 @@ export class MaybeIdRange {
 export const createMaybeIdRange = (clock, len, exists) => new MaybeIdRange(clock, len, exists)
 
 export class IdRanges {
+  // 一个 client 的区间集合。内部 _ids 可能未排序；getIds() 负责排序+合并，
+  // 并返回同一个数组（只读使用）。_lastIsUsed 用于安全的“尾部原地扩展”优化。
   /**
    * @param {Array<IdRange>} ids
    */
@@ -132,6 +150,8 @@ export class IdRanges {
    * Return the list of immutable id ranges, sorted and merged.
    */
   getIds () {
+    // 返回不可变视图：排序后把重叠/相邻区间合并成最大区间。
+    // 合并完成后 sorted=true，后续 add 若仍能接在尾部就无需再排序。
     const ids = this._ids
     this._lastIsUsed = true
     if (!this.sorted) {
@@ -195,6 +215,9 @@ export class IdRanges {
  * @implements {traits.EqualityTrait}
  */
 export class IdSet {
+  // 删除集/空洞集/插入集的统一表示：client -> IdRanges。
+  // slice() 是渲染与差集的关键：它把任意 [clock, clock+len) 切成
+  // “存在/不存在”交替的 MaybeIdRange，调用方据此只处理真正命中的片段。
   constructor () {
     /**
      * @type {Map<number,IdRanges>}
@@ -858,6 +881,8 @@ export const createInsertSetFromStructStore = (ss, filterDeleted) => {
  * @function
  */
 export const writeIdSet = (encoder, idSet) => {
+  // 编码顺序必须确定：按 client 降序写，每个 client 内按 clock 升序。
+  // V2 的 writeIdSetClock/Len 是差分编码（相对上一个 clock），所以每个 client 前 reset。
   encoding.writeVarUint(encoder.restEncoder, idSet.clients.size)
   // Ensure that the delete set is written in a deterministic order
   array.from(idSet.clients.entries())
@@ -884,6 +909,7 @@ export const writeIdSet = (encoder, idSet) => {
  * @function
  */
 export const readIdSet = decoder => {
+  // 与 writeIdSet 对称；V2 的 clock/len 是差分，所以每个 client 前 resetDsCurVal。
   const ds = new IdSet()
   const numClients = decoding.readVarUint(decoder.restDecoder)
   for (let i = 0; i < numClients; i++) {
@@ -934,6 +960,12 @@ export const decodeIdSet = data => readIdSet(new IdSetDecoderV2(decoding.createD
  * @function
  */
 export const readAndApplyDeleteSet = (decoder, transaction, store) => {
+  // 读 update 尾部的删除集并就地应用：
+  //   - 删除区间可能跨越多个 struct，先按区间边界切分 Item
+  //   - 如果删除的 clock 还没收到（clock >= state），说明依赖的 struct 缺失：
+  //     不能现在删，收集进 unappliedDS，编码成“只有删除集”的 v2 update 存到 pendingDs
+  //   - 遇到 Skip 也记为未应用，等真 struct 到达后再删
+  // 返回 null 表示全部应用完；否则返回待重试的 update。
   const unappliedDS = new IdSet()
   const numClients = decoding.readVarUint(decoder.restDecoder)
   for (let i = 0; i < numClients; i++) {
@@ -1221,6 +1253,9 @@ export class AttrRanges {
  * @template Attrs
  */
 export class IdMap {
+  // 带归因的 IdSet：区间上的 attrs 记录“这段内容是谁插入/删除的、带什么格式”。
+  // 与 IdSet 的接口刻意保持一致（has/slice/coveredLength），便于在渲染路径互换。
+  // attrsH/attrs 是归因去重表：相同 ContentAttribute 只存一份，区间引用同一个对象。
   constructor () {
     /**
      * @type {Map<number,AttrRanges<Attrs>>}
@@ -1419,6 +1454,8 @@ export const idmapAttrsEqual = (a, b) => a.length === b.length && a.every(v => i
  * @return {IdMap<T>} A fresh IdSet
  */
 export const mergeIdMaps = ams => {
+  // 合并多个 IdMap 时，先为每个归因对象建立“旧对象 -> 合并后对象”的映射，
+  // 避免同一语义的 ContentAttribute 在结果里出现多份。区间本身按 client 合并。
   /**
    * Maps attribution to the attribution of the merged idmap.
    *

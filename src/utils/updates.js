@@ -9,6 +9,20 @@ import * as string from 'lib0/string'
 
 import { readIdSet, writeIdSet, createIdSet, intersectSets } from './ids.js'
 
+// ============================================================================
+// 【中文导读】updates.js = update 级 API 的适配层
+//
+// 上层常用：
+//   - applyUpdate(V2)：解码并集成到 Doc（内部走 encoding.readUpdateV2）
+//   - encodeStateAsUpdate(V2)：导出全量或相对 state vector 的差量
+//   - encodeStateVector / decodeStateVector：state vector 编解码
+//   - diffUpdate(V2) / mergeUpdates(V2)：update 的差集与合并
+//   - convertUpdateFormat(V2)：V1<->V2、匿名化等“只换编码不改语义”的变换
+//   - logUpdate / decodeUpdate：只读调试
+//
+// 先读 encoding.js 的 integrateStructs，再回来看本文件；V1/V2 只差编码器。
+// ============================================================================
+
 import { createID } from './ID.js'
 import { IdSetEncoderV1, IdSetEncoderV2, UpdateEncoderV1, UpdateEncoderV2 } from './UpdateEncoder.js'
 import { UpdateDecoderV1, UpdateDecoderV2 } from './UpdateDecoder.js'
@@ -112,6 +126,8 @@ export const logUpdate = update => logUpdateV2(update, UpdateDecoderV1)
  * @param {typeof UpdateDecoderV2 | typeof UpdateDecoderV1} [YDecoder]
  */
 export const logUpdateV2 = (update, YDecoder = UpdateDecoderV2) => {
+  // 调试用：把 update 解码成 struct 列表与删除集打印出来。
+  // 它不集成、不改状态；看依赖关系请配合 Item.origin/rightOrigin。
   const structs = []
   const updateDecoder = new YDecoder(decoding.createDecoder(update))
   const lazyDecoder = new LazyStructReader(updateDecoder, false)
@@ -134,6 +150,8 @@ export const decodeUpdate = (update) => decodeUpdateV2(update, UpdateDecoderV1)
  *
  */
 export const decodeUpdateV2 = (update, YDecoder = UpdateDecoderV2) => {
+  // 只解码、不集成：返回 { structs, ds }。structs 里的 Item 依赖仍是远端 ID，
+  // 不能直接当本地 Item 用；需要可读状态请走 applyUpdate。
   const structs = []
   const updateDecoder = new YDecoder(decoding.createDecoder(update))
   const lazyDecoder = new LazyStructReader(updateDecoder, false)
@@ -495,6 +513,8 @@ const createObfuscator = ({ formatting = true, subdocs = true, name = true } = {
  * @param {ObfuscatorOptions} [opts]
  */
 export const obfuscateUpdate = (update, opts) => convertUpdateFormat(update, createObfuscator(opts), UpdateDecoderV1, UpdateEncoderV1)
+// 匿名化只替换内容值，保留 struct 依赖/长度/删除集，所以仍能被 Yjs 正常集成；
+// 但结构本身（谁在何时插入了多少）仍可能泄露信息，不能当强匿名。
 
 /**
  * @param {Uint8Array} update
@@ -506,6 +526,8 @@ export const obfuscateUpdateV2 = (update, opts) => convertUpdateFormat(update, c
  * @param {Uint8Array} update
  */
 export const convertUpdateFormatV1ToV2 = update => convertUpdateFormat(update, f.id, UpdateDecoderV1, UpdateEncoderV2)
+// 语义不变，只换编码器：convertUpdateFormat 解码后用 identity 变换重新编码。
+// 因此 V1->V2 与 V2->V1 可以互逆（内容相同，字节不同）。
 
 /**
  * @param {Uint8Array} update

@@ -15,6 +15,19 @@ import { sliceStruct } from './updates.js'
 import { GC } from '../structs/GC.js'
 import { writeStructs } from './encoding-helpers.js'
 
+// ============================================================================
+// 【中文导读】BlockSet = 解码后、集成前的 struct 容器
+//
+// 一个 update 解出来不是零散的 Item 数组，而是 client -> BlockRange（可顺序读的块）。
+// 它出现在三处：
+//   - readBlockSet：从 update 读出一整包（先不检查依赖）
+//   - LazyStructReader：按 clock 顺序惰性吐 struct，供 merge/diff 使用
+//   - mergeUpdatesV2：把多包按 client 做区间并集（InsertSkip 填洞）
+//
+// 与 StructStore 的区别：BlockSet 是“一次 update 的载荷”，允许乱序/有洞；
+// StructStore 是“本端已集成的权威状态”，clock 连续（空洞用 Skip 表示）。
+// ============================================================================
+
 /**
  * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder The decoder object to read data from.
  * @return {BlockSet}
@@ -23,6 +36,9 @@ import { writeStructs } from './encoding-helpers.js'
  * @function
  */
 export const readBlockSet = (decoder) => {
+  // 布局：varUint(client 数)，每个 client 一组：
+  //   varUint(块数) + client + varUint(起始 clock) + 若干块
+  // 每块靠 info 低 5 位区分 GC / Skip / Item；只有 Item 才读 origin/rightOrigin/parent。
   const clientRefs = new BlockSet()
   const numOfStateUpdates = decoding.readVarUint(decoder.restDecoder)
   for (let i = 0; i < numOfStateUpdates; i++) {
@@ -183,6 +199,10 @@ export class BlockSet {
    * @param {BlockSet} inserts
    */
   insertInto (inserts) {
+    // 把另一个 BlockSet 按 client 并入：
+    //   - 两段在 clock 上不重叠：中间缺口补 Skip，然后直接拼接（快路径）
+    //   - 有重叠：逐块归并去重，重叠处的重复 struct 只保留一份
+    // mergeUpdates 能把多个部分重叠的 update 合成一个，靠的就是这段。
     inserts.clients.forEach((newranges, clientid) => {
       const ranges = this.clients.get(clientid)
       if (ranges == null) {

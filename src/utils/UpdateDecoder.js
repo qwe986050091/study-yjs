@@ -3,6 +3,17 @@ import * as decoding from 'lib0/decoding'
 
 import { ID, createID } from './ID.js'
 
+// ============================================================================
+// 【中文导读】UpdateDecoder = update 的读端（V1 / V2）
+//
+// 与 UpdateEncoder 严格对称。V2 在构造时先读 feature flag，再依次读各列
+// （keyClock/client/leftClock/rightClock/info/string/parentInfo/typeRef/len），
+// 之后每次 readXxx 都从对应列解码；未优化的字符串/any/buf 仍从 restDecoder 读。
+//
+// 关键点：V2 的 readDsClock/readDsLen 会累加 dsCurrVal；readKey 用
+// keyClock 查 keys 缓存，未命中才从 stringDecoder 读新 key 并缓存。
+// ============================================================================
+
 /**
  * @typedef {IdSetDecoderV1 | IdSetDecoderV2} IdSetDecoder
  */

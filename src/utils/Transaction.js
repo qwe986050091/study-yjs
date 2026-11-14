@@ -17,6 +17,22 @@ import * as random from 'lib0/random'
 
 export const generateNewClientId = random.uint53
 
+// ============================================================================
+// 【中文导读】Transaction = 一次原子修改及其提交清理
+//
+// 链路位置：
+//   本地写入（YNode 的 insert/delete/setAttr）都要求先有 transaction；
+//   远端 update 经 encoding.js 的 readUpdateV2 也开一个事务，但 local=false。
+//   事务提交后，Transaction.js 负责：触达观察者 -> GC/合并 -> 生成增量 update。
+//
+// 三个集合是全部后续逻辑的输入，先记牢：
+//   - insertSet：本事务新插入的 ID 区间（= 要广播的新 struct）
+//   - deleteSet：本事务删除的 ID 区间
+//   - cleanUps：格式清理顺带删掉的区间（deleteSet 的子集，用于区分“用户删”与“清理删”）
+//
+// 阅读顺序建议：constructor -> transact() -> cleanupTransactions()。
+// ============================================================================
+
 /**
  * A transaction is created for every change on the Yjs model. It is possible
  * to bundle changes on the Yjs model in a single transaction to
@@ -66,6 +82,8 @@ export class Transaction {
     /**
      * Describes the set of inserted items by ids
      */
+    // 注意：这是“ID 区间集合”，不是 struct 列表；真正 struct 已写进 doc.store。
+    // 提交时用它生成 update，也用它判断某个 Item 是不是本事务新建的（addChangedTypeToTransaction）。
     this.insertSet = createIdSet()
     /**
      * Holds the state before the transaction started.
@@ -83,12 +101,14 @@ export class Transaction {
      * Maps from type to parentSubs (`item.parentSub = null` for YArray)
      * @type {Map<YNode,Set<String|null>>}
      */
+    // 直接变更的类型 -> 变更的 key 集合；null 表示列表内容变了（不是某个 map key）。
     this.changed = new Map()
     /**
      * Stores the events for the types that observe also child elements.
      * It is mainly used by `observeDeep`.
      * @type {Map<YNode,Array<YEvent<any>>>}
      */
+    // 与 changed 的区别：这里会把事件向上冒泡到所有祖先，供 observeDeep / 'delta' 使用。
     this.changedParentTypes = new Map()
     /**
      * @type {Array<AbstractStruct>}
@@ -134,6 +154,8 @@ export class Transaction {
    * @type {Map<Number,Number>}
    */
   get beforeState () {
+    // 用“当前 store 的 state vector” + “本事务插入区间的起点”反推事务前状态。
+    // 这是 deprecated 的兼容 API；新代码应直接用 encodeStateVector / snapshot。
     if (this._beforeState == null) {
       const sv = getStateVector(this.doc.store)
       this.insertSet.clients.forEach((ranges, client) => {
@@ -151,6 +173,7 @@ export class Transaction {
    * @type {Map<Number,Number>}
    */
   get afterState () {
+    // 必须在事务 done 之后读：insertSet 的末端才是事务结束时的 clock。
     if (!this._done) error.unexpectedCase()
     if (this._afterState == null) {
       const sv = getStateVector(this.doc.store)
@@ -209,6 +232,13 @@ export const cleanupYTextFormatting = type => {
  * @param {number} i
  */
 const cleanupTransactions = (transactionCleanups, i) => {
+  // 提交阶段（按顺序）：
+  //   1) beforeObserverCalls
+  //   2) 观察者（浅层 changed / 深层 changedParentTypes）
+  //   3) afterTransaction
+  //   4) finally：GC、struct 合并、清理
+  //   5) afterTransactionCleanup、生成增量 update、子文档事件
+  // 注意 4) 在 finally 里：观察者抛异常也必须完成 GC/合并，否则 store 会处于半提交状态。
   if (i < transactionCleanups.length) {
     const transaction = transactionCleanups[i]
     transaction._done = true
@@ -227,6 +257,7 @@ const cleanupTransactions = (transactionCleanups, i) => {
        * @type {Array<function():void>}
        */
       const fs = []
+      // 浅层观察者：每个直接变更的类型收集成一个回调，最终用 callAll 一起执行。
       // observe events on changed types. Deleted types are included: `callTypeObservers` tracks
       // the event in `changedParentTypes` unconditionally (so changes inside a deleted type — e.g.
       // a suggestion-deleted tombstone that a custom renderer still renders — bubble to live
@@ -237,6 +268,8 @@ const cleanupTransactions = (transactionCleanups, i) => {
         })
       )
       fs.push(() => {
+        // 深层观察者 / 'delta' 通道：changedParentTypes 里同时包含直接变更类型和它的祖先。
+        // 已删除且没有 renderer 的类型直接跳过：它的内容不可见，不该再通知外部。
         // deep observe events + the RDT `'delta'` channel. `changedParentTypes` holds the changed
         // type AND all of its ancestors, so both `observeDeep` and `'delta'` bubble identically.
         transaction.changedParentTypes.forEach((events, type) => {
@@ -276,12 +309,15 @@ const cleanupTransactions = (transactionCleanups, i) => {
     } finally {
       // Replace deleted items with ItemDeleted / GC.
       // This is where content is actually remove from the Yjs Doc.
+      // GC 条件：doc.gc=true、Item 已删除、未标 keep、且 gcFilter 放行。
+      // 回收后内容被丢弃；若父级也被回收，整个 Item 会被替换成等长 GC。
       if (doc.gc) {
         tryGcDeleteSet(transaction, ds, doc.gcFilter)
       }
       tryMerge(ds, store)
 
       // on all affected store.clients props, try to merge
+      // 合并相邻且同 client、clock 连续的 Item，减少对象数（纯优化，不改变语义）。
       transaction.insertSet.clients.forEach((ids, client) => {
         const firstClock = ids.getIds()[0].clock
         const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
@@ -308,11 +344,14 @@ const cleanupTransactions = (transactionCleanups, i) => {
         }
       }
       if (!transaction.local && transaction.insertSet.clients.has(doc.clientID)) {
+        // 远端 update 里出现了“本端 clientID”的新 struct：说明有另一个实例在用同一个 clientID。
+        // 不换 ID 会让后续本地写入与对端历史纠缠，这里直接换一个新 clientID。
         logging.print(logging.ORANGE, logging.BOLD, '[yjs] ', logging.UNBOLD, logging.RED, 'Changed the client-id because another client seems to be using it.')
         doc.clientID = generateNewClientId()
       }
       // @todo Merge all the transactions into one and provide send the data as a single update message
       doc.emit('afterTransactionCleanup', [transaction, doc])
+      // 增量 update 是“本事务 insertSet + deleteSet”的编码；没有这两个集合的事件不广播。
       if (doc._observers.has('update')) {
         const encoder = new UpdateEncoderV1()
         const hasContent = writeUpdateMessageFromTransaction(encoder, transaction)
@@ -342,9 +381,11 @@ const cleanupTransactions = (transactionCleanups, i) => {
       }
 
       if (transactionCleanups.length <= i + 1) {
+        // 队列清空：所有嵌套事务都提交完了，发 afterAllTransactions。
         doc._transactionCleanups = []
         doc.emit('afterAllTransactions', [doc, transactionCleanups])
       } else {
+        // 观察者里又开了新事务：不递归调用，而是用下标串行消费，避免深层调用栈。
         cleanupTransactions(transactionCleanups, i + 1)
       }
     }
@@ -415,6 +456,8 @@ export const transact = (doc, f, origin = null, local = true) => {
    */
   let result = null
   if (doc._transaction === null) {
+    // 最外层调用：新建事务并入队。嵌套调用（doc._transaction 非空）直接复用当前事务，
+    // 因此 `transact(() => transact(...))` 仍然只广播一条 update。
     initialCall = true
     doc._transaction = new Transaction(doc, origin, local)
     transactionCleanups.push(doc._transaction)
@@ -427,6 +470,8 @@ export const transact = (doc, f, origin = null, local = true) => {
     result = f(doc._transaction)
   } finally {
     if (initialCall) {
+      // 只有最外层负责收尾；即使 f 抛异常也要把 _transaction 清空并跑清理，
+      // 否则文档会永久卡在“有未提交事务”的状态。
       const finishCleanup = doc._transaction === transactionCleanups[0]
       doc._transaction = null
       if (finishCleanup) {

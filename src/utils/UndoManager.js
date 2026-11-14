@@ -6,6 +6,18 @@ import { ObservableV2 } from 'lib0/observable'
 import { mergeIdSets, iterateStructsByIdSet, diffIdSet } from './ids.js'
 import { Item, followRedone } from '../structs/Item.js'
 
+// ============================================================================
+// 【中文导读】UndoManager = 基于事务的撤销/重做（分支主题）
+//
+// 它不是“保存旧值”，而是把一次事务的 (insertSet, deleteSet) 记成 StackItem；
+// undo 时反向操作：删除当时插入的、恢复当时删除的（用 keep 标记防 GC），
+// redo 再反过来。核心难点：
+//   - captureTimeout 内连续编辑合并成一个 StackItem
+//   - trackedOrigins 决定哪些来源的变更可撤销（默认只撤本地 null origin）
+//   - redoItem 要处理父级已被删除、map key 被覆盖、嵌套 YNode 等边界
+// 读之前先理解 Transaction.insertSet/deleteSet 与 Item.delete/gc。
+// ============================================================================
+
 import { transact } from './Transaction.js'
 import { createID } from './ID.js'
 import { isParentOf } from './isParentOf.js'
@@ -158,6 +170,8 @@ export class UndoManager extends ObservableV2 {
    * @param {UndoManagerOptions} options
    */
   constructor (typeScope, {
+    // captureTimeout：500ms 内的连续编辑合并；captureTransaction 可拒绝某些事务；
+    // deleteFilter 过滤不该恢复的删除；trackedOrigins 默认 {null} 只撤本地编辑。
     captureTimeout = 500,
     captureTransaction = _tr => true,
     deleteFilter = () => true,
@@ -335,6 +349,9 @@ export class UndoManager extends ObservableV2 {
    * @return {StackItem?} Returns StackItem if a change was applied
    */
   undo () {
+    // undo 不是“回滚事务”，而是新建一个事务：删除 StackItem 里记录的插入、
+    // 恢复它记录的删除（见 redoItem）。因此撤销本身也是一次正常 CRDT 变更，会被广播。
+    // popStackItem 会把弹出的 StackItem 移到 redoStack。
     this.undoing = true
     let res
     try {
@@ -351,6 +368,7 @@ export class UndoManager extends ObservableV2 {
    * @return {StackItem?} Returns StackItem if a change was applied
    */
   redo () {
+    // redo = 把 undo 产生的反向事务再反向一次；undoStack / redoStack 在这里互换角色。
     this.redoing = true
     let res
     try {

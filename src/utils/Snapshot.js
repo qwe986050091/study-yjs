@@ -13,6 +13,18 @@ import { UpdateEncoderV2, IdSetEncoderV1, IdSetEncoderV2 } from './UpdateEncoder
 import { LazyStructReader } from './updates.js'
 import { Doc } from './Doc.js'
 
+// ============================================================================
+// 【中文导读】Snapshot = state vector + 删除集
+//
+// 快照不是整份文档的拷贝，而是“某个时刻每个 client 收到哪、哪些区间被删”。
+//   - sv：client -> clock，表示该时刻已集成到哪
+//   - ds：该时刻的删除集
+// 用它可以：
+//   - 比较两个时刻（equalSnapshots）
+//   - 从当前文档导出“快照时刻的可见状态”（见下方 encodeStateAsUpdate 相关函数）
+//   - 配合 splitSnapshotAffectedStructs，保证 Item 边界落在快照 clock 上
+// ============================================================================
+
 export class Snapshot {
   /**
    * @param {IdSet} ds
@@ -96,12 +108,17 @@ export const emptySnapshot = createSnapshot(createIdSet(), new Map())
  * @return {Snapshot}
  */
 export const snapshot = doc => createSnapshot(createDeleteSetFromStructStore(doc.store), getStateVector(doc.store))
+// 对当前文档打快照：删除集从 store 里扫出来，state vector 直接取 store 的。
+// 这是 O(结构数)，不要在热路径反复调用。
 
 /**
  * @param {Transaction} transaction
  * @param {Snapshot} snapshot
  */
 export const splitSnapshotAffectedStructs = (transaction, snapshot) => {
+  // 快照要求 Item 边界正好落在 snapshot 的 clock 上；否则“快照时刻”会切在 Item 中间。
+  // 这里对每个 client 在 snapshot clock 处 split，并把删除集覆盖的 Item 也切一遍。
+  // 用 transaction.meta 去重，同一个快照在一个事务里只处理一次。
   const meta = map.setIfUndefined(transaction.meta, splitSnapshotAffectedStructs, set.create)
   const store = transaction.doc.store
   // check if we already split for this snapshot
